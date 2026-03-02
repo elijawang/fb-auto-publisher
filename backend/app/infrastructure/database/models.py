@@ -61,6 +61,21 @@ class VideoLogStatus(str, enum.Enum):
 
 # ==================== 数据表 ====================
 
+class AccountGroup(Base):
+    """账号分组表（如按语种分类）"""
+    __tablename__ = "account_groups"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    name = Column(String(100), nullable=False, unique=True, comment="分组名称（如：英语、日语、中文）")
+    color = Column(String(20), default="#3498db", comment="分组颜色（十六进制色值）")
+    description = Column(Text, default="", comment="分组描述")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # 关联
+    accounts = relationship("FBAccount", back_populates="group")
+
+
 class FBAccount(Base):
     """Facebook账号表"""
     __tablename__ = "fb_accounts"
@@ -70,12 +85,14 @@ class FBAccount(Base):
     password_encrypted = Column(Text, nullable=False, comment="加密后的密码")
     name = Column(String(100), nullable=False, comment="账号别名")
     profile_url = Column(String(500), default="", comment="账号个人主页链接")
+    group_id = Column(String(36), ForeignKey("account_groups.id", ondelete="SET NULL"), nullable=True, comment="所属分组ID")
     tags = Column(String(500), default="", comment="标签，逗号分隔")
     status = Column(String(20), default=AccountStatus.PENDING_AUTH.value, comment="账号状态")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # 关联
+    group = relationship("AccountGroup", back_populates="accounts")
     pages = relationship("FBPage", back_populates="account", cascade="all, delete-orphan")
     browser_profile = relationship("BrowserProfile", back_populates="account", uselist=False,
                                    cascade="all, delete-orphan")

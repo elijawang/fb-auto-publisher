@@ -14,6 +14,9 @@ from app.infrastructure.config.settings import get_settings
 from app.infrastructure.database.connection import get_session
 from app.domain.task.task_service import TaskService
 from app.domain.account.account_service import AccountService
+from app.infrastructure.database.models import FBAccount, FBPage
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 router = APIRouter()
 
@@ -35,6 +38,11 @@ class SchedulePreview(BaseModel):
 class TaskResponse(BaseModel):
     id: str
     account_id: str
+    account_name: str = ""
+    account_profile_url: str = ""
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    group_color: Optional[str] = None
     task_name: str
     description: str
     start_time: str
@@ -54,6 +62,7 @@ class VideoResponse(BaseModel):
     scheduled_time: str
     page_id: str = ""
     page_name: str = ""
+    page_url: str = ""
     status: str = "pending"
     error_message: str = ""
 
@@ -156,30 +165,111 @@ async def upload_videos(
     }
 
 
-@router.get("/", response_model=List[TaskResponse])
+class TaskListResponse(BaseModel):
+    items: List[TaskResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+@router.get("/", response_model=TaskListResponse)
 async def list_tasks(
     account_id: Optional[str] = None,
     status: Optional[str] = None,
+    date: Optional[str] = None,
+    group_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
     session: AsyncSession = Depends(get_session),
 ):
-    """获取任务列表"""
+    """
+    获取任务列表（含账号信息）
+    
+    支持按天查询、按分组查询和分页：
+    - date: 日期字符串 "YYYY-MM-DD"，默认当天
+    - group_id: 分组ID，按账号分组筛选任务
+    - page: 页码（从1开始）
+    - page_size: 每页条数，默认20
+    """
+    from datetime import date as date_type
+
+    # 如果未传入日期，默认当天
+    if not date:
+        date = date_type.today().isoformat()
+
     service = TaskService(session)
-    tasks = await service.list_tasks(account_id=account_id, status=status)
-    return [TaskResponse(
-        id=t.id, account_id=t.account_id, task_name=t.task_name,
+    result = await service.list_tasks(
+        account_id=account_id,
+        status=status,
+        date_str=date,
+        group_id=group_id,
+        page=page,
+        page_size=page_size,
+    )
+    tasks = result["items"]
+
+    # 批量获取所有相关账号信息（含分组）
+    account_ids = list(set(t.account_id for t in tasks))
+    account_map = {}
+    if account_ids:
+        from app.infrastructure.database.models import AccountGroup
+        acc_result = await session.execute(
+            select(FBAccount)
+            .options(selectinload(FBAccount.pages), selectinload(FBAccount.group))
+            .where(FBAccount.id.in_(account_ids))
+        )
+        for acc in acc_result.scalars().all():
+            account_map[acc.id] = acc
+
+    items = [TaskResponse(
+        id=t.id, account_id=t.account_id,
+        account_name=account_map.get(t.account_id, None) and account_map[t.account_id].name or "",
+        account_profile_url=account_map.get(t.account_id, None) and account_map[t.account_id].profile_url or "",
+        group_id=account_map.get(t.account_id, None) and account_map[t.account_id].group_id or None,
+        group_name=(account_map.get(t.account_id, None) and account_map[t.account_id].group and account_map[t.account_id].group.name) or None,
+        group_color=(account_map.get(t.account_id, None) and account_map[t.account_id].group and account_map[t.account_id].group.color) or None,
+        task_name=t.task_name,
         description=t.description, start_time=t.start_time.isoformat(),
         interval_minutes=t.interval_minutes, status=t.status,
         video_count=len(t.videos) if t.videos else 0,
     ) for t in tasks]
 
+    return TaskListResponse(
+        items=items,
+        total=result["total"],
+        page=result["page"],
+        page_size=result["page_size"],
+    )
+
 
 @router.get("/{task_id}", response_model=dict)
 async def get_task(task_id: str, session: AsyncSession = Depends(get_session)):
-    """获取任务详情"""
+    """获取任务详情（含账号信息和公共主页链接）"""
     service = TaskService(session)
     task = await service.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
+
+    # 获取账号信息及其公共主页和分组
+    account_name = ""
+    account_profile_url = ""
+    group_name = None
+    group_color = None
+    page_url_map = {}  # page_name -> page_url 映射
+    acc_result = await session.execute(
+        select(FBAccount)
+        .options(selectinload(FBAccount.pages), selectinload(FBAccount.group))
+        .where(FBAccount.id == task.account_id)
+    )
+    account = acc_result.scalar_one_or_none()
+    if account:
+        account_name = account.name or ""
+        account_profile_url = account.profile_url or ""
+        if account.group:
+            group_name = account.group.name
+            group_color = account.group.color
+        for p in (account.pages or []):
+            page_url_map[p.page_name] = p.page_url or ""
 
     videos = [VideoResponse(
         id=v.id, task_id=v.task_id, file_name=v.file_name,
@@ -187,6 +277,7 @@ async def get_task(task_id: str, session: AsyncSession = Depends(get_session)):
         scheduled_time=v.scheduled_time.isoformat(),
         page_id=v.page_id or "",
         page_name=v.page_name or "",
+        page_url=page_url_map.get(v.page_name, ""),
         status=v.status or "pending",
         error_message=v.error_message or "",
     ) for v in (task.videos or [])]
@@ -194,6 +285,10 @@ async def get_task(task_id: str, session: AsyncSession = Depends(get_session)):
     return {
         "id": task.id,
         "account_id": task.account_id,
+        "account_name": account_name,
+        "account_profile_url": account_profile_url,
+        "group_name": group_name,
+        "group_color": group_color,
         "task_name": task.task_name,
         "description": task.description,
         "start_time": task.start_time.isoformat(),

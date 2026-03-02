@@ -2,15 +2,44 @@
   <div>
     <div class="page-header">
       <h2>📋 账号管理</h2>
-      <el-button type="primary" @click="showCreateDialog = true">
-        <el-icon><Plus /></el-icon> 新增账号
-      </el-button>
+      <div style="display: flex; gap: 8px;">
+        <el-button type="primary" @click="showCreateDialog = true">
+          <el-icon><Plus /></el-icon> 新增账号
+        </el-button>
+        <el-button type="success" @click="showGroupDialog = true">
+          <el-icon><Folder /></el-icon> 分组管理
+        </el-button>
+      </div>
+    </div>
+
+    <!-- 分组筛选 -->
+    <div style="margin-bottom: 16px; display: flex; align-items: center; gap: 12px;">
+      <span style="font-weight: 500;">分组筛选：</span>
+      <el-select v-model="filterGroupId" placeholder="全部" clearable @change="loadAccounts" style="width: 200px;">
+        <el-option label="全部" value="" />
+        <el-option v-for="group in groups" :key="group.id" :label="group.name" :value="group.id">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <div :style="{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: group.color }"></div>
+            <span>{{ group.name }}</span>
+            <span style="color: #999; font-size: 12px;">({{ group.account_count }}个账号)</span>
+          </div>
+        </el-option>
+      </el-select>
     </div>
 
     <!-- 账号列表 -->
     <el-table :data="accounts" stripe style="width: 100%" v-loading="loading">
       <el-table-column prop="name" label="账号名称" width="150" />
       <el-table-column prop="email" label="登录邮箱" width="220" />
+      <el-table-column prop="group_name" label="分组" width="120">
+        <template #default="{ row }">
+          <div v-if="row.group_name" style="display: flex; align-items: center; gap: 6px;">
+            <div :style="{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: row.group_color }"></div>
+            <span>{{ row.group_name }}</span>
+          </div>
+          <span v-else style="color: #999;">未分组</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="tags" label="标签" width="150">
         <template #default="{ row }">
           <el-tag v-for="tag in (row.tags || '').split(',')" :key="tag" size="small"
@@ -63,6 +92,16 @@
         <el-form-item label="名称">
           <el-input v-model="form.name" placeholder="账号别名（便于识别）" />
         </el-form-item>
+        <el-form-item label="分组">
+          <el-select v-model="form.group_id" placeholder="选择分组" clearable style="width: 100%;">
+            <el-option v-for="group in groups" :key="group.id" :label="group.name" :value="group.id">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <div :style="{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: group.color }"></div>
+                <span>{{ group.name }}</span>
+              </div>
+            </el-option>
+          </el-select>
+        </el-form-item>
         <el-form-item label="账号主页">
           <el-input v-model="form.profile_url" placeholder="个人主页链接（如 https://www.facebook.com/xxx）" />
         </el-form-item>
@@ -73,6 +112,53 @@
       <template #footer>
         <el-button @click="showCreateDialog = false">取消</el-button>
         <el-button type="primary" @click="isEditing ? updateAccount() : createAccount()" :loading="submitting">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 分组管理对话框 -->
+    <el-dialog v-model="showGroupDialog" title="📁 分组管理" width="600px">
+      <div style="margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+        <el-input v-model="newGroupName" placeholder="分组名称" style="width: 150px;" />
+        <el-color-picker v-model="newGroupColor" show-alpha :predefine="predefineColors" />
+        <el-input v-model="newGroupDesc" placeholder="分组描述（可选）" style="width: 200px;" />
+        <el-button type="primary" @click="createGroup" size="small">新增分组</el-button>
+      </div>
+      <el-table :data="groups" stripe>
+        <el-table-column prop="name" label="分组名称" width="150">
+          <template #default="{ row }">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <div :style="{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: row.color }"></div>
+              <span>{{ row.name }}</span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column prop="description" label="描述" show-overflow-tooltip />
+        <el-table-column prop="account_count" label="账号数量" width="100" />
+        <el-table-column label="操作" width="120">
+          <template #default="{ row }">
+            <el-button size="small" type="primary" text @click="editGroup(row)">编辑</el-button>
+            <el-button size="small" type="danger" text @click="deleteGroup(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-dialog>
+
+    <!-- 编辑分组对话框 -->
+    <el-dialog v-model="showEditGroupDialog" title="编辑分组" width="500px">
+      <el-form :model="editGroupForm" label-width="80px">
+        <el-form-item label="名称">
+          <el-input v-model="editGroupForm.name" />
+        </el-form-item>
+        <el-form-item label="颜色">
+          <el-color-picker v-model="editGroupForm.color" show-alpha :predefine="predefineColors" />
+        </el-form-item>
+        <el-form-item label="描述">
+          <el-input v-model="editGroupForm.description" type="textarea" :rows="3" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showEditGroupDialog = false">取消</el-button>
+        <el-button type="primary" @click="updateGroup" :loading="submittingGroup">保存</el-button>
       </template>
     </el-dialog>
 
@@ -134,9 +220,12 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { accountApi, browserApi } from '../api/index.js'
 
 const accounts = ref([])
+const groups = ref([])
 const loading = ref(false)
 const submitting = ref(false)
 const showCreateDialog = ref(false)
+const showGroupDialog = ref(false)
+const showEditGroupDialog = ref(false)
 const showPagesDialog = ref(false)
 const selectedAccount = ref(null)
 const pages = ref([])
@@ -149,8 +238,14 @@ const editPageForm = ref({ page_name: '', page_url: '', page_fb_id: '' })
 const isEditing = ref(false)
 const editingAccountId = ref(null)
 const pageLoginLoadingId = ref(null)
+const filterGroupId = ref('')
+const newGroupName = ref('')
+const newGroupColor = ref('#3498db')
+const newGroupDesc = ref('')
+const editGroupForm = ref({ id: '', name: '', color: '', description: '' })
+const submittingGroup = ref(false)
 
-const form = ref({ email: '', password: '', name: '', tags: '', profile_url: '' })
+const form = ref({ email: '', password: '', name: '', tags: '', profile_url: '', group_id: '' })
 const loginLoadingId = ref(null)
 const authWaitingId = ref(null)
 const authConfirming = ref(false)
@@ -159,15 +254,34 @@ let authPollTimer = null
 const statusType = (s) => ({ normal: 'success', pending_auth: 'warning', restricted: 'danger', banned: 'danger' }[s] || 'info')
 const statusLabel = (s) => ({ normal: '正常', pending_auth: '待认证', restricted: '受限', banned: '封禁' }[s] || s)
 
+// 预定义颜色
+const predefineColors = [
+  '#ff4500', '#ff8c00', '#ffd700', '#90ee90', '#00ced1',
+  '#1e90ff', '#c71585', '#ff69b4', '#da70d6', '#9932cc',
+  '#ff0000', '#ff6347', '#ffa500', '#ffff00', '#9acd32',
+  '#00ff00', '#20b2aa', '#00bfff', '#0000ff', '#8a2be2'
+]
+
 async function loadAccounts() {
   loading.value = true
   try {
-    const { data } = await accountApi.list()
+    const params = {}
+    if (filterGroupId.value) params.group_id = filterGroupId.value
+    const { data } = await accountApi.list(params)
     accounts.value = data
   } catch (e) {
     ElMessage.error('加载账号失败')
   } finally {
     loading.value = false
+  }
+}
+
+async function loadGroups() {
+  try {
+    const { data } = await accountApi.listGroups()
+    groups.value = data
+  } catch (e) {
+    ElMessage.error('加载分组失败')
   }
 }
 
@@ -177,13 +291,67 @@ async function createAccount() {
     await accountApi.create(form.value)
     ElMessage.success('账号创建成功')
     showCreateDialog.value = false
-    form.value = { email: '', password: '', name: '', tags: '', profile_url: '' }
+    form.value = { email: '', password: '', name: '', tags: '', profile_url: '', group_id: '' }
     isEditing.value = false
     loadAccounts()
   } catch (e) {
     ElMessage.error('创建失败: ' + (e.response?.data?.detail || e.message))
   } finally {
     submitting.value = false
+  }
+}
+
+async function createGroup() {
+  if (!newGroupName.value) return ElMessage.warning('请输入分组名称')
+  try {
+    await accountApi.createGroup({
+      name: newGroupName.value,
+      color: newGroupColor.value,
+      description: newGroupDesc.value,
+    })
+    ElMessage.success('分组创建成功')
+    newGroupName.value = ''
+    newGroupColor.value = '#3498db'
+    newGroupDesc.value = ''
+    loadGroups()
+  } catch (e) {
+    ElMessage.error('创建失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+function editGroup(group) {
+  editGroupForm.value = {
+    id: group.id,
+    name: group.name,
+    color: group.color,
+    description: group.description || '',
+  }
+  showEditGroupDialog.value = true
+}
+
+async function updateGroup() {
+  submittingGroup.value = true
+  try {
+    await accountApi.updateGroup(editGroupForm.value.id, editGroupForm.value)
+    ElMessage.success('分组更新成功')
+    showEditGroupDialog.value = false
+    loadGroups()
+  } catch (e) {
+    ElMessage.error('更新失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    submittingGroup.value = false
+  }
+}
+
+async function deleteGroup(group) {
+  await ElMessageBox.confirm(`确定要删除分组 "${group.name}" 吗？该分组下的账号将变为未分组状态。`, '确认删除', { type: 'warning' })
+  try {
+    await accountApi.deleteGroup(group.id)
+    ElMessage.success('分组删除成功')
+    loadGroups()
+    loadAccounts()
+  } catch (e) {
+    ElMessage.error('删除失败: ' + (e.response?.data?.detail || e.message))
   }
 }
 
@@ -256,7 +424,7 @@ async function confirmAuth(row) {
 async function editAccount(row) {
   isEditing.value = true
   editingAccountId.value = row.id
-  form.value = { email: row.email, password: '', name: row.name, tags: row.tags, profile_url: row.profile_url || '' }
+  form.value = { email: row.email, password: '', name: row.name, tags: row.tags, profile_url: row.profile_url || '', group_id: row.group_id || '' }
   showCreateDialog.value = true
 }
 
@@ -268,7 +436,7 @@ async function updateAccount() {
     await accountApi.update(editingAccountId.value, data)
     ElMessage.success('账号更新成功')
     showCreateDialog.value = false
-    form.value = { email: '', password: '', name: '', tags: '', profile_url: '' }
+    form.value = { email: '', password: '', name: '', tags: '', profile_url: '', group_id: '' }
     isEditing.value = false
     editingAccountId.value = null
     loadAccounts()
@@ -390,7 +558,10 @@ async function removePage(row) {
   }
 }
 
-onMounted(loadAccounts)
+onMounted(() => {
+  loadAccounts()
+  loadGroups()
+})
 </script>
 
 <style scoped>

@@ -13,7 +13,7 @@ from loguru import logger
 
 from app.infrastructure.config.settings import get_settings
 from app.infrastructure.database.models import (
-    PublishTask, TaskVideo, TaskStatus, TaskLog, VideoLogStatus, VideoStatus, FBPage,
+    PublishTask, TaskVideo, TaskStatus, TaskLog, VideoLogStatus, VideoStatus, FBPage, FBAccount,
 )
 
 
@@ -146,19 +146,73 @@ class TaskService:
         self,
         account_id: Optional[str] = None,
         status: Optional[str] = None,
-    ) -> List[PublishTask]:
-        """获取任务列表"""
-        query = select(PublishTask).options(
+        date_str: Optional[str] = None,
+        group_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        """
+        获取任务列表（支持按天过滤和分页）
+        
+        Args:
+            date_str: 日期字符串 "YYYY-MM-DD"，为空则不过滤
+            page: 页码（从1开始）
+            page_size: 每页条数
+        
+        Returns:
+            {"items": [...], "total": int, "page": int, "page_size": int}
+        """
+        from sqlalchemy import func
+
+        base_query = select(PublishTask).options(
             selectinload(PublishTask.videos),
             selectinload(PublishTask.logs),
         )
+        count_query = select(func.count(PublishTask.id))
+
+        # 过滤条件
         if account_id:
-            query = query.where(PublishTask.account_id == account_id)
+            base_query = base_query.where(PublishTask.account_id == account_id)
+            count_query = count_query.where(PublishTask.account_id == account_id)
         if status:
-            query = query.where(PublishTask.status == status)
-        query = query.order_by(PublishTask.created_at.desc())
-        result = await self.session.execute(query)
-        return list(result.scalars().all())
+            base_query = base_query.where(PublishTask.status == status)
+            count_query = count_query.where(PublishTask.status == status)
+        if group_id:
+            # 通过关联FBAccount表按分组筛选
+            base_query = base_query.join(FBAccount, PublishTask.account_id == FBAccount.id).where(FBAccount.group_id == group_id)
+            count_query = count_query.join(FBAccount, PublishTask.account_id == FBAccount.id).where(FBAccount.group_id == group_id)
+        if date_str:
+            try:
+                target_date = datetime.strptime(date_str, "%Y-%m-%d")
+                day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                day_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+                base_query = base_query.where(
+                    PublishTask.created_at >= day_start,
+                    PublishTask.created_at <= day_end,
+                )
+                count_query = count_query.where(
+                    PublishTask.created_at >= day_start,
+                    PublishTask.created_at <= day_end,
+                )
+            except ValueError:
+                logger.warning(f"无效的日期格式: {date_str}，忽略日期过滤")
+
+        # 总数
+        total_result = await self.session.execute(count_query)
+        total = total_result.scalar() or 0
+
+        # 分页
+        offset = (page - 1) * page_size
+        base_query = base_query.order_by(PublishTask.created_at.desc()).offset(offset).limit(page_size)
+        result = await self.session.execute(base_query)
+        items = list(result.scalars().all())
+
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     async def update_task_status(self, task_id: str, status: TaskStatus) -> bool:
         """更新任务状态"""
@@ -260,6 +314,28 @@ class TaskService:
             f"(成功: {published}/{total}, 失败: {failed}/{total})"
         )
         return final_status
+
+    async def reset_page_videos_for_retry(
+        self,
+        task_id: str,
+        page_name: str,
+    ) -> List[TaskVideo]:
+        """
+        重置某个主页下所有失败/待发布的视频子任务状态为 pending，准备重新执行。
+        返回被重置的视频子任务列表。
+        """
+        videos = await self.get_videos_by_page(task_id, page_name)
+        reset_videos = []
+        for v in videos:
+            # 只重置非成功状态的视频
+            if v.status != VideoStatus.PUBLISHED.value:
+                await self.update_video_status(v.id, VideoStatus.PENDING)
+                reset_videos.append(v)
+        logger.info(
+            f"重置主页视频子任务: task_id={task_id}, page={page_name}, "
+            f"重置 {len(reset_videos)}/{len(videos)} 个"
+        )
+        return reset_videos
 
     async def get_task_schedule_preview(
         self, start_time: datetime, interval_minutes: int, video_count: int

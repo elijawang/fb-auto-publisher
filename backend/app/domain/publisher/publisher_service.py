@@ -203,6 +203,109 @@ class PublisherService:
         # 认证成功后重新执行任务
         return await self.execute_task(task_id)
 
+    async def retry_failed_videos(
+        self, task_id: str, page_name: str, video_ids: List[str]
+    ) -> dict:
+        """
+        重试指定的失败视频子任务。
+        
+        流程：
+        1. 启动浏览器并登录
+        2. 切换到对应的公共主页
+        3. 仅对指定的失败视频重新上传并发布
+        4. 更新子任务状态
+        5. 重新推断主任务状态
+        """
+        task = await self.task_service.get_task(task_id)
+        if not task:
+            return {"success": False, "message": "任务不存在"}
+
+        # 获取要重试的视频子任务
+        from sqlalchemy import select
+        result = await self.session.execute(
+            select(TaskVideo).where(TaskVideo.id.in_(video_ids))
+        )
+        retry_videos = list(result.scalars().all())
+        if not retry_videos:
+            return {"success": False, "message": "未找到要重试的视频子任务"}
+
+        # 获取账号和主页信息
+        from sqlalchemy.orm import selectinload
+        acc_result = await self.session.execute(
+            select(FBAccount)
+            .options(selectinload(FBAccount.pages))
+            .where(FBAccount.id == task.account_id)
+        )
+        account = acc_result.scalar_one_or_none()
+        if not account:
+            return {"success": False, "message": "账号不存在"}
+
+        # 找到对应的公共主页
+        fb_page = None
+        for p in account.pages:
+            if p.page_name == page_name:
+                fb_page = p
+                break
+        if not fb_page:
+            return {"success": False, "message": f"未找到公共主页: {page_name}"}
+
+        logger.info(
+            f"重试发布 {len(retry_videos)} 个失败视频 -> 主页: {page_name}"
+        )
+
+        try:
+            # 步骤1: 启动浏览器并登录
+            login_result = await self.browser_manager.login_facebook(
+                account.id, wait_for_auth=True
+            )
+            if not login_result["success"]:
+                for v in retry_videos:
+                    await self.task_service.update_video_status(
+                        v.id, VideoStatus.FAILED, f"登录失败: {login_result['message']}"
+                    )
+                await self.task_service.finalize_task_status(task_id)
+                return {"success": False, "message": f"登录失败: {login_result['message']}"}
+
+            page = await self.browser_manager.get_page(account.id)
+            if not page:
+                await self.task_service.finalize_task_status(task_id)
+                return {"success": False, "message": "无法获取浏览器页面"}
+
+            # 步骤2: 切换到对应主页并批量发布
+            await self._switch_to_page(page, fb_page)
+            await asyncio.sleep(random.uniform(1, 3))
+
+            batch_result = await self._publish_videos_batch(
+                page=page,
+                task=task,
+                videos=retry_videos,
+                fb_page=fb_page,
+                account=account,
+            )
+
+            # 步骤3: 关闭浏览器
+            await self.browser_manager.close_browser(account.id)
+
+            # 步骤4: 更新主任务状态
+            final_status = await self.task_service.finalize_task_status(task_id)
+
+            summary = (
+                f"重试完成 | 成功: {batch_result['success_count']} | "
+                f"失败: {batch_result['fail_count']} | 最终状态: {final_status.value}"
+            )
+            logger.info(summary)
+            return {"success": batch_result['fail_count'] == 0, "message": summary}
+
+        except Exception as e:
+            logger.error(f"重试视频异常: {e}")
+            for v in retry_videos:
+                await self.task_service.update_video_status(
+                    v.id, VideoStatus.FAILED, str(e)
+                )
+            await self.task_service.finalize_task_status(task_id)
+            await self.browser_manager.close_browser(account.id)
+            return {"success": False, "message": f"重试异常: {str(e)}"}
+
     async def _switch_to_page(self, page: Page, fb_page: FBPage):
         """
         切换到指定公共主页的上下文。
@@ -345,9 +448,8 @@ class PublisherService:
                 # 4. 统一填写视频描述（使用任务的统一描述）
                 await self._fill_description_batch(page, task.description, video_count)
 
-                # 5. 设置排期时间（如果任务有排期设置）
-                if task.start_time:
-                    await self._set_scheduled_time(page, task.start_time)
+                # 5. 为每个视频设置定时发布时间（从任务起始时间开始，按间隔递增）
+                await self._set_scheduled_times_per_video(page, videos)
 
                 # 6. 勾选所有视频的 checkbox，然后点击批量发布按钮
                 await self._select_all_videos(page, video_count)
@@ -1058,87 +1160,372 @@ class PublisherService:
         if filled_count == 0:
             logger.warning("未找到描述输入框，跳过描述填写")
 
+    async def _set_scheduled_times_per_video(self, page: Page, videos: List[TaskVideo]):
+        """
+        在 Meta Business Suite Bulk upload 页面中，为每个视频逐个设置定时发布时间。
+        
+        每个视频的 scheduled_time 已在创建任务时根据起始时间和间隔自动计算。
+        此方法需要：
+        1. 找到页面上每个视频条目的排期/发布时间设置区域
+        2. 将发布方式从"立即发布"切换为"定时发布"
+        3. 填入该视频对应的 scheduled_time
+        
+        Meta Business Suite Bulk upload 页面中，每个视频条目通常有一个
+        发布选项（Schedule/Publish now），需要逐个展开并设置时间。
+        """
+        video_count = len(videos)
+        logger.info(f"开始为 {video_count} 个视频逐个设置定时发布时间...")
+
+        try:
+            # ========== 策略1: 通过 JS 查找所有视频条目并逐个设置排期时间 ==========
+            # 在 Bulk upload 页面中，每个视频都有一组发布选项
+            # 先尝试找到所有发布选项/排期下拉区域
+            
+            # 查找所有视频条目中的排期选项区域
+            schedule_option_selectors = [
+                # 每个视频条目中的"Schedule"下拉/选项
+                'div[aria-label="Publishing options"]',
+                'div[aria-label="发布选项"]',
+                'div[aria-label="Scheduling options"]',
+                'div[aria-label="排期选项"]',
+                # 下拉菜单触发器
+                'div[aria-label*="date and time"]',
+                'div[aria-label*="日期和时间"]',
+            ]
+            
+            # 查找所有排期选项相关的元素
+            option_elements = None
+            used_selector = None
+            for selector in schedule_option_selectors:
+                count = await page.locator(selector).count()
+                if count > 0:
+                    option_elements = page.locator(selector)
+                    used_selector = selector
+                    logger.info(f"找到 {count} 个排期选项区域: {selector}")
+                    break
+
+            if option_elements and await option_elements.count() >= video_count:
+                # 逐个视频设置排期
+                for i, video in enumerate(videos):
+                    try:
+                        scheduled_time = video.scheduled_time
+                        if not scheduled_time:
+                            logger.warning(f"视频 {video.file_name} 没有排期时间，跳过")
+                            continue
+
+                        # 点击当前视频的排期选项
+                        option_el = option_elements.nth(i)
+                        await option_el.click()
+                        await asyncio.sleep(1)
+
+                        # 切换到定时发布模式
+                        await self._switch_to_schedule_mode(page)
+
+                        # 设置日期和时间
+                        await self._fill_schedule_datetime(page, scheduled_time)
+
+                        # 关闭排期面板（点击空白区域或确认按钮）
+                        await self._close_schedule_panel(page)
+                        await asyncio.sleep(0.5)
+
+                        logger.info(
+                            f"视频 {i + 1}/{video_count} ({video.file_name}) "
+                            f"定时发布时间设置为: {scheduled_time}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"设置视频 {i + 1} ({video.file_name}) 排期时间失败: {e}，继续下一个"
+                        )
+                        continue
+            else:
+                # ========== 策略2: 通过 JS 遍历所有视频行，逐个设置 ==========
+                logger.info("未找到标准排期选项区域，尝试通过 JS 方式设置...")
+                await self._set_scheduled_times_via_js(page, videos)
+
+            logger.info(f"所有视频定时发布时间设置完成")
+
+        except Exception as e:
+            logger.warning(f"设置定时发布时间失败: {e}，将以默认方式处理")
+
+    async def _switch_to_schedule_mode(self, page: Page):
+        """
+        在排期面板中，将发布方式从"立即发布"切换为"定时发布"。
+        """
+        schedule_mode_selectors = [
+            # 排期选项 radio/按钮
+            'input[type="radio"][value="SCHEDULED"]',
+            'label:has-text("Schedule")',
+            'label:has-text("排期")',
+            'label:has-text("Programar")',
+            'span:has-text("Schedule")',
+            'span:has-text("排期")',
+            'span:has-text("Programar")',
+            # 定时发布选项
+            'div[role="radio"]:has-text("Schedule")',
+            'div[role="radio"]:has-text("排期")',
+            'div[role="radio"]:has-text("Programar")',
+            'div[role="option"]:has-text("Schedule")',
+            'div[role="option"]:has-text("排期")',
+            'div[role="option"]:has-text("Programar")',
+            # 下拉选项
+            'div[role="menuitemradio"]:has-text("Schedule")',
+            'div[role="menuitemradio"]:has-text("排期")',
+            'div[role="menuitemradio"]:has-text("Programar")',
+        ]
+        for selector in schedule_mode_selectors:
+            try:
+                el = page.locator(selector).first
+                if await el.is_visible(timeout=2000):
+                    await el.click()
+                    await asyncio.sleep(0.5)
+                    logger.info(f"已切换到定时发布模式: {selector}")
+                    return
+            except Exception:
+                continue
+
+        # JS 兜底：查找并点击排期相关选项
+        try:
+            await page.evaluate("""
+                () => {
+                    const keywords = ['schedule', '排期', 'programar'];
+                    const elements = document.querySelectorAll(
+                        'div[role="radio"], div[role="option"], label, span, div[role="menuitemradio"]'
+                    );
+                    for (const el of elements) {
+                        const text = (el.textContent || '').trim().toLowerCase();
+                        for (const kw of keywords) {
+                            if (text === kw || text.startsWith(kw)) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"JS 切换排期模式失败: {e}")
+
+    async def _fill_schedule_datetime(self, page: Page, scheduled_time: datetime):
+        """
+        在排期面板中填写指定的日期和时间。
+        """
+        # 设置日期
+        date_str = scheduled_time.strftime("%Y/%m/%d")
+        date_selectors = [
+            'input[aria-label*="Date"]',
+            'input[aria-label*="日期"]',
+            'input[aria-label*="date"]',
+            'input[placeholder*="Date"]',
+            'input[placeholder*="日期"]',
+            'input[aria-label*="Fecha"]',
+        ]
+        date_set = False
+        for selector in date_selectors:
+            try:
+                date_input = page.locator(selector).first
+                if await date_input.is_visible(timeout=2000):
+                    await date_input.click(click_count=3)  # 全选现有内容
+                    await asyncio.sleep(0.2)
+                    await date_input.fill(date_str)
+                    await asyncio.sleep(0.2)
+                    # 按Tab键确认日期输入
+                    await date_input.press("Tab")
+                    date_set = True
+                    logger.debug(f"已设置日期: {date_str}")
+                    break
+            except Exception:
+                continue
+        if not date_set:
+            logger.warning(f"未找到日期输入框，无法设置日期: {date_str}")
+
+        # 设置时间
+        time_str = scheduled_time.strftime("%H:%M")
+        time_selectors = [
+            'input[aria-label*="Time"]',
+            'input[aria-label*="时间"]',
+            'input[aria-label*="time"]',
+            'input[placeholder*="Time"]',
+            'input[placeholder*="时间"]',
+            'input[aria-label*="Hora"]',
+        ]
+        time_set = False
+        for selector in time_selectors:
+            try:
+                time_input = page.locator(selector).first
+                if await time_input.is_visible(timeout=2000):
+                    await time_input.click(click_count=3)  # 全选现有内容
+                    await asyncio.sleep(0.2)
+                    await time_input.fill(time_str)
+                    await asyncio.sleep(0.2)
+                    await time_input.press("Tab")
+                    time_set = True
+                    logger.debug(f"已设置时间: {time_str}")
+                    break
+            except Exception:
+                continue
+        if not time_set:
+            logger.warning(f"未找到时间输入框，无法设置时间: {time_str}")
+
+        await asyncio.sleep(0.5)
+
+    async def _close_schedule_panel(self, page: Page):
+        """
+        关闭排期设置面板/弹窗。
+        """
+        # 尝试点击确认/保存/完成按钮
+        close_selectors = [
+            'button:has-text("Done")',
+            'button:has-text("完成")',
+            'button:has-text("Save")',
+            'button:has-text("保存")',
+            'button:has-text("Apply")',
+            'button:has-text("应用")',
+            'button:has-text("OK")',
+            'button:has-text("确定")',
+            'button:has-text("Listo")',
+            'button:has-text("Guardar")',
+            'button:has-text("Aplicar")',
+        ]
+        for selector in close_selectors:
+            try:
+                btn = page.locator(selector).first
+                if await btn.is_visible(timeout=1500):
+                    await btn.click()
+                    await asyncio.sleep(0.5)
+                    logger.debug(f"已关闭排期面板: {selector}")
+                    return
+            except Exception:
+                continue
+
+        # 兜底：按 Escape 关闭
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
+    async def _set_scheduled_times_via_js(self, page: Page, videos: List[TaskVideo]):
+        """
+        通过 JavaScript 方式在 Bulk upload 页面为每个视频设置定时发布时间。
+        
+        当标准 Playwright selector 无法定位排期选项时的兜底方案：
+        遍历页面上的视频行，找到每行中与排期相关的可交互元素并逐一设置。
+        """
+        for i, video in enumerate(videos):
+            if not video.scheduled_time:
+                continue
+            
+            scheduled_time = video.scheduled_time
+            date_str = scheduled_time.strftime("%Y/%m/%d")
+            time_str = scheduled_time.strftime("%H:%M")
+            
+            try:
+                # 通过 JS 找到并点击第 i 个视频的排期选项
+                clicked = await page.evaluate(f"""
+                    (index) => {{
+                        // 查找所有可能的视频条目行
+                        const rows = document.querySelectorAll(
+                            'div[role="row"], div[role="listitem"], tr, div[data-testid*="video"], div[data-testid*="reel"]'
+                        );
+                        
+                        // 如果没有找到行，尝试查找所有排期相关的下拉/按钮
+                        const scheduleButtons = [];
+                        const allElements = document.querySelectorAll(
+                            'div[role="button"], button, select, div[aria-haspopup]'
+                        );
+                        for (const el of allElements) {{
+                            const text = (el.textContent || '').trim().toLowerCase();
+                            const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                            const publishKeywords = [
+                                'publish now', 'schedule', '立即发布', '排期', 'publicar ahora', 'programar',
+                                'publish option', 'publishing option', '发布选项'
+                            ];
+                            for (const kw of publishKeywords) {{
+                                if (text.includes(kw) || ariaLabel.includes(kw)) {{
+                                    const rect = el.getBoundingClientRect();
+                                    if (rect.width > 0 && rect.height > 0) {{
+                                        scheduleButtons.push(el);
+                                    }}
+                                    break;
+                                }}
+                            }}
+                        }}
+                        
+                        if (scheduleButtons.length > index) {{
+                            scheduleButtons[index].click();
+                            return {{ found: true, type: 'schedule_button', total: scheduleButtons.length }};
+                        }}
+                        
+                        if (rows.length > index) {{
+                            // 在对应行中查找排期相关元素
+                            const row = rows[index];
+                            const rowButtons = row.querySelectorAll(
+                                'div[role="button"], button, select, div[aria-haspopup]'
+                            );
+                            for (const btn of rowButtons) {{
+                                const text = (btn.textContent || '').trim().toLowerCase();
+                                if (text.includes('publish') || text.includes('schedule') || 
+                                    text.includes('发布') || text.includes('排期') ||
+                                    text.includes('publicar') || text.includes('programar')) {{
+                                    btn.click();
+                                    return {{ found: true, type: 'row_button' }};
+                                }}
+                            }}
+                        }}
+                        
+                        return {{ found: false, rows: rows.length, buttons: scheduleButtons.length }};
+                    }}
+                """, i)
+                
+                if clicked and clicked.get('found'):
+                    await asyncio.sleep(1)
+                    
+                    # 切换到定时发布模式
+                    await self._switch_to_schedule_mode(page)
+                    
+                    # 填写日期和时间
+                    await self._fill_schedule_datetime(page, scheduled_time)
+                    
+                    # 关闭面板
+                    await self._close_schedule_panel(page)
+                    await asyncio.sleep(0.5)
+                    
+                    logger.info(
+                        f"视频 {i + 1}/{len(videos)} ({video.file_name}) "
+                        f"通过 JS 方式设置定时发布: {scheduled_time}"
+                    )
+                else:
+                    logger.warning(
+                        f"视频 {i + 1}/{len(videos)} ({video.file_name}) "
+                        f"未找到排期选项: {clicked}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"视频 {i + 1}/{len(videos)} ({video.file_name}) "
+                    f"JS 方式设置排期失败: {e}"
+                )
+                continue
+
     async def _set_scheduled_time(self, page: Page, scheduled_time: datetime):
         """
-        在 Meta Business Suite 中设置定时发布时间。
+        在 Meta Business Suite 中设置全局定时发布时间（兼容旧逻辑）。
+        
+        注意：此方法已被 _set_scheduled_times_per_video 替代用于批量发布场景。
+        保留此方法以供单视频发布场景或兼容使用。
         
         Meta Business Suite 的排期流程：
         1. 点击 "Schedule" / "排期" 按钮（或展开发布选项）
         2. 设置日期和时间
         """
         try:
-            # 步骤1: 查找并点击排期选项
-            # Meta Business Suite 中可能是一个下拉菜单或切换按钮
-            schedule_selectors = [
-                # 排期按钮/选项
-                'button:has-text("Schedule")',
-                'button:has-text("排期")',
-                'div[aria-label="Schedule"]',
-                'div[aria-label="排期"]',
-                'span:has-text("Schedule")',
-                'span:has-text("排期")',
-                # 发布选项下拉（可能需要先展开）
-                'div[aria-label="Publishing options"]',
-                'div[aria-label="发布选项"]',
-                # 日程安排选项
-                'input[type="radio"][value="SCHEDULED"]',
-                'label:has-text("Schedule")',
-                'label:has-text("排期")',
-            ]
-            for selector in schedule_selectors:
-                try:
-                    btn = page.locator(selector).first
-                    if await btn.is_visible(timeout=3000):
-                        await btn.click()
-                        await asyncio.sleep(1)
-                        logger.info(f"已点击排期选项: {selector}")
-                        break
-                except Exception:
-                    continue
+            # 步骤1: 切换到定时发布模式
+            await self._switch_to_schedule_mode(page)
 
-            # 步骤2: 设置日期
-            date_str = scheduled_time.strftime("%Y/%m/%d")
-            date_selectors = [
-                'input[aria-label*="Date"]',
-                'input[aria-label*="日期"]',
-                'input[aria-label*="date"]',
-                'input[placeholder*="Date"]',
-                'input[placeholder*="日期"]',
-            ]
-            for selector in date_selectors:
-                try:
-                    date_input = page.locator(selector).first
-                    if await date_input.is_visible(timeout=3000):
-                        await date_input.click(triple=True)  # 全选现有内容
-                        await asyncio.sleep(0.2)
-                        await date_input.fill(date_str)
-                        logger.info(f"已设置日期: {date_str}")
-                        break
-                except Exception:
-                    continue
+            # 步骤2: 填写日期和时间
+            await self._fill_schedule_datetime(page, scheduled_time)
 
-            # 步骤3: 设置时间
-            time_str = scheduled_time.strftime("%H:%M")
-            time_selectors = [
-                'input[aria-label*="Time"]',
-                'input[aria-label*="时间"]',
-                'input[aria-label*="time"]',
-                'input[placeholder*="Time"]',
-                'input[placeholder*="时间"]',
-            ]
-            for selector in time_selectors:
-                try:
-                    time_input = page.locator(selector).first
-                    if await time_input.is_visible(timeout=3000):
-                        await time_input.click(triple=True)  # 全选现有内容
-                        await asyncio.sleep(0.2)
-                        await time_input.fill(time_str)
-                        logger.info(f"已设置时间: {time_str}")
-                        break
-                except Exception:
-                    continue
-
-            await asyncio.sleep(1)
             logger.info(f"已设置定时发布: {scheduled_time}")
 
         except Exception as e:
@@ -1523,3 +1910,123 @@ class PublisherService:
             "未找到发布按钮（Publicar / Publish / 发布 等），"
             "请确认视频已上传完成、已勾选所有视频，且 Bulk upload reels 页面正常加载"
         )
+
+    async def retry_failed_videos(
+        self,
+        task_id: str,
+        page_name: str,
+        video_ids: List[str],
+    ) -> dict:
+        """
+        重试某个公共主页下指定的视频子任务。
+        
+        流程：
+        1. 启动浏览器并登录
+        2. 切换到目标主页
+        3. 仅发布指定的视频子任务
+        4. 更新状态
+        5. 重新推断主任务状态
+        
+        Args:
+            task_id: 任务ID
+            page_name: 公共主页名称
+            video_ids: 需要重试的视频子任务ID列表
+        """
+        task = await self.task_service.get_task(task_id)
+        if not task:
+            return {"success": False, "message": "任务不存在"}
+
+        # 获取账号和主页信息
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        result = await self.session.execute(
+            select(FBAccount)
+            .options(selectinload(FBAccount.pages))
+            .where(FBAccount.id == task.account_id)
+        )
+        account = result.scalar_one_or_none()
+        if not account:
+            return {"success": False, "message": "账号不存在"}
+
+        # 找到目标主页
+        fb_page = None
+        for p in account.pages:
+            if p.page_name == page_name:
+                fb_page = p
+                break
+        if not fb_page:
+            return {"success": False, "message": f"未找到主页: {page_name}"}
+
+        # 获取该主页下需要重试的视频子任务
+        page_videos = await self.task_service.get_videos_by_page(task_id, page_name)
+        retry_videos = [v for v in page_videos if v.id in video_ids]
+        if not retry_videos:
+            return {"success": False, "message": "没有需要重试的视频子任务"}
+
+        # 将这些视频状态标记为上传中
+        for v in retry_videos:
+            await self.task_service.update_video_status(v.id, VideoStatus.UPLOADING)
+
+        logger.info(
+            f"开始重试发布: task={task.task_name}, page={page_name}, "
+            f"视频数量={len(retry_videos)}"
+        )
+
+        try:
+            # 步骤1: 启动浏览器并登录
+            login_result = await self.browser_manager.login_facebook(
+                account.id, wait_for_auth=True
+            )
+            if not login_result["success"]:
+                # 登录失败，更新视频状态
+                for v in retry_videos:
+                    await self.task_service.update_video_status(
+                        v.id, VideoStatus.FAILED, f"登录失败: {login_result['message']}"
+                    )
+                await self.task_service.finalize_task_status(task_id)
+                return {"success": False, "message": f"登录失败: {login_result['message']}"}
+
+            page = await self.browser_manager.get_page(account.id)
+            if not page:
+                for v in retry_videos:
+                    await self.task_service.update_video_status(
+                        v.id, VideoStatus.FAILED, "无法获取浏览器页面"
+                    )
+                await self.task_service.finalize_task_status(task_id)
+                return {"success": False, "message": "无法获取浏览器页面"}
+
+            # 步骤2: 切换到目标主页
+            await self._switch_to_page(page, fb_page)
+            await asyncio.sleep(random.uniform(1, 3))
+
+            # 步骤3: 批量发布该主页下的视频
+            batch_result = await self._publish_videos_batch(
+                page=page,
+                task=task,
+                videos=retry_videos,
+                fb_page=fb_page,
+                account=account,
+            )
+
+            # 步骤4: 重新推断主任务状态
+            final_status = await self.task_service.finalize_task_status(task_id)
+
+            return {
+                "success": True,
+                "message": (
+                    f"主页 {page_name} 重试完成: "
+                    f"成功 {batch_result['success_count']}, "
+                    f"失败 {batch_result['fail_count']}"
+                ),
+                "task_status": final_status.value,
+            }
+
+        except Exception as e:
+            logger.error(f"重试发布异常: {e}")
+            # 将重试的视频标记为失败
+            for v in retry_videos:
+                await self.task_service.update_video_status(
+                    v.id, VideoStatus.FAILED, str(e)
+                )
+            await self.task_service.finalize_task_status(task_id)
+            return {"success": False, "message": f"重试失败: {str(e)}"}

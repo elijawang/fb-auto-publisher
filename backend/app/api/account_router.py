@@ -22,6 +22,7 @@ class AccountCreate(BaseModel):
     name: str
     tags: str = ""
     profile_url: str = ""
+    group_id: Optional[str] = None
 
 class AccountUpdate(BaseModel):
     email: Optional[str] = None
@@ -30,6 +31,7 @@ class AccountUpdate(BaseModel):
     tags: Optional[str] = None
     status: Optional[str] = None
     profile_url: Optional[str] = None
+    group_id: Optional[str] = None
 
 class PageCreate(BaseModel):
     page_name: str
@@ -41,6 +43,26 @@ class PageUpdate(BaseModel):
     page_url: Optional[str] = None
     page_fb_id: Optional[str] = None
 
+class GroupCreate(BaseModel):
+    name: str
+    color: str = "#3498db"
+    description: str = ""
+
+class GroupUpdate(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+    description: Optional[str] = None
+
+class GroupResponse(BaseModel):
+    id: str
+    name: str
+    color: str
+    description: str
+    account_count: int = 0
+
+    class Config:
+        from_attributes = True
+
 class AccountResponse(BaseModel):
     id: str
     email: str
@@ -48,6 +70,9 @@ class AccountResponse(BaseModel):
     tags: str
     status: str
     profile_url: str = ""
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    group_color: Optional[str] = None
     pages_count: int = 0
     is_logged_in: bool = False
 
@@ -67,7 +92,61 @@ class PageResponse(BaseModel):
         from_attributes = True
 
 
-# ==================== 路由 ====================
+# ==================== 分组管理路由 ====================
+
+@router.post("/groups/", response_model=GroupResponse)
+async def create_group(data: GroupCreate, session: AsyncSession = Depends(get_session)):
+    """创建分组"""
+    service = AccountService(session)
+    group = await service.create_group(name=data.name, color=data.color, description=data.description)
+    count = await service.get_group_account_count(group.id)
+    return GroupResponse(id=group.id, name=group.name, color=group.color, description=group.description or "", account_count=count)
+
+
+@router.get("/groups/", response_model=List[GroupResponse])
+async def list_groups(session: AsyncSession = Depends(get_session)):
+    """获取分组列表"""
+    service = AccountService(session)
+    groups = await service.list_groups()
+    result = []
+    for g in groups:
+        count = await service.get_group_account_count(g.id)
+        result.append(GroupResponse(id=g.id, name=g.name, color=g.color, description=g.description or "", account_count=count))
+    return result
+
+
+@router.get("/groups/{group_id}", response_model=GroupResponse)
+async def get_group(group_id: str, session: AsyncSession = Depends(get_session)):
+    """获取分组详情"""
+    service = AccountService(session)
+    group = await service.get_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="分组不存在")
+    count = await service.get_group_account_count(group.id)
+    return GroupResponse(id=group.id, name=group.name, color=group.color, description=group.description or "", account_count=count)
+
+
+@router.put("/groups/{group_id}", response_model=dict)
+async def update_group(group_id: str, data: GroupUpdate, session: AsyncSession = Depends(get_session)):
+    """更新分组"""
+    service = AccountService(session)
+    group = await service.update_group(group_id, name=data.name, color=data.color, description=data.description)
+    if not group:
+        raise HTTPException(status_code=404, detail="分组不存在")
+    return {"message": f"分组 {group.name} 更新成功"}
+
+
+@router.delete("/groups/{group_id}", response_model=dict)
+async def delete_group(group_id: str, session: AsyncSession = Depends(get_session)):
+    """删除分组"""
+    service = AccountService(session)
+    success = await service.delete_group(group_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="分组不存在")
+    return {"message": "分组已删除"}
+
+
+# ==================== 账号管理路由 ====================
 
 @router.post("/", response_model=dict)
 async def create_account(data: AccountCreate, session: AsyncSession = Depends(get_session)):
@@ -75,16 +154,16 @@ async def create_account(data: AccountCreate, session: AsyncSession = Depends(ge
     service = AccountService(session)
     account = await service.create_account(
         email=data.email, password=data.password, name=data.name,
-        tags=data.tags, profile_url=data.profile_url,
+        tags=data.tags, profile_url=data.profile_url, group_id=data.group_id,
     )
     return {"id": account.id, "message": f"账号 {account.name} 创建成功"}
 
 
 @router.get("/", response_model=List[AccountResponse])
-async def list_accounts(tag: Optional[str] = None, session: AsyncSession = Depends(get_session)):
-    """获取账号列表"""
+async def list_accounts(tag: Optional[str] = None, group_id: Optional[str] = None, session: AsyncSession = Depends(get_session)):
+    """获取账号列表（支持按标签、分组筛选）"""
     service = AccountService(session)
-    accounts = await service.list_accounts(tag=tag)
+    accounts = await service.list_accounts(tag=tag, group_id=group_id)
     result = []
     for acc in accounts:
         result.append(AccountResponse(
@@ -94,6 +173,9 @@ async def list_accounts(tag: Optional[str] = None, session: AsyncSession = Depen
             tags=acc.tags,
             status=acc.status,
             profile_url=acc.profile_url or "",
+            group_id=acc.group_id,
+            group_name=acc.group.name if acc.group else None,
+            group_color=acc.group.color if acc.group else None,
             pages_count=len(acc.pages) if acc.pages else 0,
             is_logged_in=acc.browser_profile.is_logged_in if acc.browser_profile else False,
         ))
@@ -111,6 +193,9 @@ async def get_account(account_id: str, session: AsyncSession = Depends(get_sessi
         id=account.id, email=account.email, name=account.name,
         tags=account.tags, status=account.status,
         profile_url=account.profile_url or "",
+        group_id=account.group_id,
+        group_name=account.group.name if account.group else None,
+        group_color=account.group.color if account.group else None,
         pages_count=len(account.pages) if account.pages else 0,
         is_logged_in=account.browser_profile.is_logged_in if account.browser_profile else False,
     )
@@ -124,7 +209,7 @@ async def update_account(account_id: str, data: AccountUpdate, session: AsyncSes
         account_id=account_id,
         email=data.email, password=data.password,
         name=data.name, tags=data.tags, status=data.status,
-        profile_url=data.profile_url,
+        profile_url=data.profile_url, group_id=data.group_id,
     )
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")

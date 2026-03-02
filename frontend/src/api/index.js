@@ -21,6 +21,12 @@ export const accountApi = {
   removePage: (pageId) => api.delete(`/accounts/pages/${pageId}`),
   updatePage: (pageId, data) => api.put(`/accounts/pages/${pageId}`, data),
   fetchPages: (accountId) => api.post(`/accounts/${accountId}/pages/fetch`, {}, { timeout: 120000 }),
+  // 分组管理
+  createGroup: (data) => api.post('/accounts/groups/', data),
+  listGroups: () => api.get('/accounts/groups/'),
+  getGroup: (id) => api.get(`/accounts/groups/${id}`),
+  updateGroup: (id, data) => api.put(`/accounts/groups/${id}`, data),
+  deleteGroup: (id) => api.delete(`/accounts/groups/${id}`),
 }
 
 // ==================== 任务管理 ====================
@@ -51,6 +57,8 @@ export const browserApi = {
 export const publisherApi = {
   execute: (taskId) => api.post(`/publisher/execute/${taskId}`),
   resume: (taskId) => api.post(`/publisher/resume/${taskId}`),
+  retryVideo: (videoId) => api.post(`/publisher/retry-video/${videoId}`),
+  retryPage: (taskId, pageName) => api.post(`/publisher/retry-page/${taskId}/${encodeURIComponent(pageName)}`),
 }
 
 // ==================== 日志管理 ====================

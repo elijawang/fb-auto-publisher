@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from loguru import logger
 
-from app.infrastructure.database.models import FBAccount, FBPage, BrowserProfile
+from app.infrastructure.database.models import FBAccount, FBPage, BrowserProfile, AccountGroup
 from app.infrastructure.encryption.cipher import encrypt_password, decrypt_password
 
 
@@ -18,8 +18,71 @@ class AccountService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
+    # ==================== 分组管理 ====================
+
+    async def create_group(self, name: str, color: str = "#3498db", description: str = "") -> AccountGroup:
+        """创建分组"""
+        group = AccountGroup(name=name, color=color, description=description)
+        self.session.add(group)
+        await self.session.commit()
+        await self.session.refresh(group)
+        logger.info(f"创建分组: {name} (颜色: {color})")
+        return group
+
+    async def get_group(self, group_id: str) -> Optional[AccountGroup]:
+        """根据ID获取分组"""
+        result = await self.session.execute(
+            select(AccountGroup).where(AccountGroup.id == group_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def list_groups(self) -> List[AccountGroup]:
+        """获取所有分组（含账号数量）"""
+        result = await self.session.execute(
+            select(AccountGroup).order_by(AccountGroup.created_at)
+        )
+        return list(result.scalars().all())
+
+    async def update_group(self, group_id: str, name: str = None, color: str = None,
+                           description: str = None) -> Optional[AccountGroup]:
+        """更新分组"""
+        group = await self.get_group(group_id)
+        if not group:
+            return None
+        if name is not None:
+            group.name = name
+        if color is not None:
+            group.color = color
+        if description is not None:
+            group.description = description
+        await self.session.commit()
+        await self.session.refresh(group)
+        logger.info(f"更新分组: {group.name}")
+        return group
+
+    async def delete_group(self, group_id: str) -> bool:
+        """删除分组（分组下的账号将变为未分组状态）"""
+        group = await self.get_group(group_id)
+        if not group:
+            return False
+        await self.session.delete(group)
+        await self.session.commit()
+        logger.info(f"删除分组: {group.name}")
+        return True
+
+    async def get_group_account_count(self, group_id: str) -> int:
+        """获取分组下的账号数量"""
+        from sqlalchemy import func
+        result = await self.session.execute(
+            select(func.count(FBAccount.id)).where(FBAccount.group_id == group_id)
+        )
+        return result.scalar() or 0
+
+    # ==================== 账号管理 ====================
+
     async def create_account(self, email: str, password: str, name: str,
-                             tags: str = "", profile_url: str = "") -> FBAccount:
+                             tags: str = "", profile_url: str = "",
+                             group_id: str = None) -> FBAccount:
         """创建新账号"""
         account = FBAccount(
             email=email,
@@ -27,6 +90,7 @@ class AccountService:
             name=name,
             profile_url=profile_url,
             tags=tags,
+            group_id=group_id if group_id else None,
         )
         self.session.add(account)
         await self.session.commit()
@@ -35,22 +99,29 @@ class AccountService:
         return account
 
     async def get_account(self, account_id: str) -> Optional[FBAccount]:
-        """根据ID获取账号（含关联的主页和浏览器配置）"""
+        """根据ID获取账号（含关联的主页、浏览器配置和分组）"""
         result = await self.session.execute(
             select(FBAccount)
-            .options(selectinload(FBAccount.pages), selectinload(FBAccount.browser_profile))
+            .options(
+                selectinload(FBAccount.pages),
+                selectinload(FBAccount.browser_profile),
+                selectinload(FBAccount.group),
+            )
             .where(FBAccount.id == account_id)
         )
         return result.scalar_one_or_none()
 
-    async def list_accounts(self, tag: Optional[str] = None) -> List[FBAccount]:
-        """获取账号列表，可按标签筛选"""
+    async def list_accounts(self, tag: Optional[str] = None, group_id: Optional[str] = None) -> List[FBAccount]:
+        """获取账号列表，可按标签或分组筛选"""
         query = select(FBAccount).options(
             selectinload(FBAccount.pages),
             selectinload(FBAccount.browser_profile),
+            selectinload(FBAccount.group),
         )
         if tag:
             query = query.where(FBAccount.tags.contains(tag))
+        if group_id:
+            query = query.where(FBAccount.group_id == group_id)
         query = query.order_by(FBAccount.created_at.desc())
         result = await self.session.execute(query)
         return list(result.scalars().all())
@@ -58,7 +129,7 @@ class AccountService:
     async def update_account(
         self, account_id: str, email: str = None, password: str = None,
         name: str = None, tags: str = None, status: str = None,
-        profile_url: str = None
+        profile_url: str = None, group_id: str = None,
     ) -> Optional[FBAccount]:
         """更新账号信息"""
         account = await self.get_account(account_id)
@@ -76,6 +147,8 @@ class AccountService:
             account.tags = tags
         if status is not None:
             account.status = status
+        if group_id is not None:
+            account.group_id = group_id if group_id else None
         await self.session.commit()
         await self.session.refresh(account)
         logger.info(f"更新账号: {account.name}")

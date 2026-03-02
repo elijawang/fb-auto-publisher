@@ -48,6 +48,7 @@ def _migrate_tables(connection):
         existing_columns = {col["name"] for col in inspector.get_columns("fb_accounts")}
         fb_account_migrations = [
             ("profile_url", "VARCHAR(500) DEFAULT ''"),
+            ("group_id", "VARCHAR(36) DEFAULT NULL"),
         ]
         for col_name, col_type in fb_account_migrations:
             if col_name not in existing_columns:
