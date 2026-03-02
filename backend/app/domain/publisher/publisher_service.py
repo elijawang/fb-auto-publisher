@@ -1867,10 +1867,12 @@ class PublisherService:
                         searchContainers = [document];
                     }
                     
-                    // 在容器中搜索所有可见 input
+                    // 在容器中搜索所有可见 input 和 select
                     let allVisibleInputs = [];
+                    let allVisibleSelects = [];
                     const seenElements = new Set();
                     for (const container of searchContainers) {
+                        // 搜索 input 元素
                         const inputs = container.querySelectorAll('input');
                         for (const input of inputs) {
                             if (seenElements.has(input)) continue;
@@ -1879,6 +1881,7 @@ class PublisherService:
                             if (rect.width > 0 && rect.height > 0 && !input.disabled) {
                                 allVisibleInputs.push({
                                     element: input,
+                                    tagName: 'INPUT',
                                     type: input.type || 'text',
                                     value: input.value || '',
                                     label: input.getAttribute('aria-label') || '',
@@ -1893,6 +1896,7 @@ class PublisherService:
                                 });
                             }
                         }
+
                     }
                     
                     // 按 y 坐标优先排序（日期通常在上方，时间在下方）
@@ -1900,6 +1904,7 @@ class PublisherService:
                     
                     // 收集调试信息
                     result.debugInputs = allVisibleInputs.map(item => ({
+                        tagName: item.tagName,
                         type: item.type,
                         value: item.value.substring(0, 40),
                         label: item.label.substring(0, 40),
@@ -1912,6 +1917,7 @@ class PublisherService:
                         centerX: item.centerX,
                         centerY: item.centerY
                     }));
+
                     
                     // ===== 分类 input：日期 / 小时 / 分钟 / 完整时间 =====
                     let dateItem = null;
@@ -1935,19 +1941,21 @@ class PublisherService:
                             }
                         }
                         
-                        // 判断小时输入框：label 包含 hour/hora/小时，或值为 1-2 位纯数字且 < 24
+                        // 判断小时输入框：label 包含 hour/hora/小时/hh，或 type=number 且宽度较窄
                         if (!hourItem) {
                             if (/hour|hora|小时|hh/i.test(label) ||
-                                (type !== 'time' && /^\\d{1,2}$/.test(val) && parseInt(val) < 24 && !minuteItem)) {
+                                (type !== 'time' && type !== 'date' && /^\d{0,2}$/.test(val) && 
+                                 (val === '' || parseInt(val) < 24) && !minuteItem && item.width < 150)) {
                                 hourItem = item;
                                 continue;
                             }
                         }
                         
-                        // 判断分钟输入框：label 包含 minute/minuto/分钟，或值为 1-2 位纯数字且 < 60
+                        // 判断分钟输入框：label 包含 minute/minuto/分钟/mm，或紧跟在小时输入框之后的窄 input
                         if (!minuteItem) {
                             if (/minute|minuto|分钟|mm/i.test(label) ||
-                                (type !== 'time' && /^\\d{1,2}$/.test(val) && parseInt(val) < 60 && hourItem)) {
+                                (type !== 'time' && type !== 'date' && /^\d{0,2}$/.test(val) && 
+                                 (val === '' || parseInt(val) < 60) && hourItem && item.width < 150)) {
                                 minuteItem = item;
                                 continue;
                             }
@@ -1981,7 +1989,7 @@ class PublisherService:
                             result.inferredByPosition = true;
                         }
                     }
-                    // 如果识别出日期但时间部分未分类，尝试将剩余 input 作为小时/分钟
+                    // 如果识别出日期但时间部分未分类，尝试将剩余 input/select 作为小时/分钟
                     if (dateItem && !hourItem && !minuteItem && !timeItem) {
                         const remaining = allVisibleInputs.filter(i => i !== dateItem);
                         if (remaining.length >= 2) {
@@ -2029,7 +2037,9 @@ class PublisherService:
                             centerX: hourItem.centerX,
                             centerY: hourItem.centerY,
                             currentValue: hourItem.value,
-                            label: hourItem.label
+                            label: hourItem.label,
+                            type: hourItem.type || 'text',
+                            width: hourItem.width
                         };
                     }
                     
@@ -2038,7 +2048,9 @@ class PublisherService:
                             centerX: minuteItem.centerX,
                             centerY: minuteItem.centerY,
                             currentValue: minuteItem.value,
-                            label: minuteItem.label
+                            label: minuteItem.label,
+                            type: minuteItem.type || 'text',
+                            width: minuteItem.width
                         };
                     }
                     
@@ -2071,6 +2083,9 @@ class PublisherService:
             f"总input数={input_info.get('totalInputs')}, "
             f"弹窗数={input_info.get('totalContainers')}"
         )
+        debug_inputs = input_info.get('debugInputs', [])
+        if debug_inputs:
+            logger.info(f"弹窗中找到的 input 元素: {debug_inputs}")
         if input_info.get('inferredByPosition'):
             logger.warning("日期/时间输入框是按位置推断的，可能不准确")
         
@@ -2079,10 +2094,9 @@ class PublisherService:
             input_info.get('minuteInput') or input_info.get('timeInput')
         )
         if not has_any_input:
-            debug_inputs = input_info.get('debugInputs', [])
             logger.error(
-                f"❌ 未找到任何日期/时间输入框，弹窗中所有 input:\n" +
-                "\n".join(str(inp) for inp in debug_inputs)
+                f"❌ 未找到任何日期/时间输入框\n"
+                f"弹窗中所有 input: {input_info.get('debugInputs', [])}"
             )
             return
         
@@ -2274,23 +2288,22 @@ class PublisherService:
         
         if hour_info and minute_info:
             # ---- 模式A：小时和分钟是两个独立的 input ----
-            logger.info(f"时间输入模式: 小时+分钟分开，hour={hour_str}, minute={minute_str}")
+            # 小时/分钟 input 只能通过键盘事件赋值，不能用 JS 直接设值
+            logger.info(
+                f"时间输入模式: 小时+分钟分开（键盘输入），hour={hour_str}, minute={minute_str}"
+            )
             
-            # 填写小时（先 JS，再键盘）
+            # 填写小时（直接使用键盘输入）
             cx_h, cy_h = hour_info['centerX'], hour_info['centerY']
             prev_hour = hour_info.get('currentValue', '')
-            h_success = await _set_input_value_by_js(cx_h, cy_h, hour_str, "小时", prev_hour)
-            if not h_success:
-                await _type_into_input(cx_h, cy_h, hour_str, "小时", prev_hour)
+            h_success = await _type_into_input(cx_h, cy_h, hour_str, "小时", prev_hour)
             
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
             
-            # 填写分钟（先 JS，再键盘）
+            # 填写分钟（直接使用键盘输入）
             cx_m, cy_m = minute_info['centerX'], minute_info['centerY']
             prev_min = minute_info.get('currentValue', '')
-            m_success = await _set_input_value_by_js(cx_m, cy_m, minute_str, "分钟", prev_min)
-            if not m_success:
-                await _type_into_input(cx_m, cy_m, minute_str, "分钟", prev_min)
+            m_success = await _type_into_input(cx_m, cy_m, minute_str, "分钟", prev_min)
             
         elif time_info:
             # ---- 模式B：合并的 HH:MM 时间输入框 ----
@@ -2324,9 +2337,8 @@ class PublisherService:
             # 只找到小时 input，没有分钟
             logger.warning("⚠️ 只找到小时输入框，未找到分钟输入框")
             cx_h, cy_h = hour_info['centerX'], hour_info['centerY']
-            h_success = await _set_input_value_by_js(cx_h, cy_h, hour_str, "小时", hour_info.get('currentValue', ''))
-            if not h_success:
-                await _type_into_input(cx_h, cy_h, hour_str, "小时", hour_info.get('currentValue', ''))
+            prev_hour = hour_info.get('currentValue', '')
+            await _type_into_input(cx_h, cy_h, hour_str, "小时", prev_hour)
         else:
             logger.warning("⚠️ 未找到任何时间输入框，跳过时间设置")
         
