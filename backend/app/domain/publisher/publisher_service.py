@@ -1165,87 +1165,293 @@ class PublisherService:
         在 Meta Business Suite Bulk upload 页面中，为每个视频逐个设置定时发布时间。
         
         每个视频的 scheduled_time 已在创建任务时根据起始时间和间隔自动计算。
-        此方法需要：
-        1. 找到页面上每个视频条目的排期/发布时间设置区域
-        2. 将发布方式从"立即发布"切换为"定时发布"
-        3. 填入该视频对应的 scheduled_time
         
-        Meta Business Suite Bulk upload 页面中，每个视频条目通常有一个
-        发布选项（Schedule/Publish now），需要逐个展开并设置时间。
+        Meta Business Suite Bulk upload 页面的表格结构：
+        - 每行视频有多列：缩略图、标题/描述、标签、**发布选项（第4列）**、...
+        - 第4列默认显示 "Publicar ahora"（立即发布）/ "Publish now" / "立即发布"
+        - 需要点击第4列展开下拉菜单，选择 "Programar"（定时发布）/ "Schedule" / "排期"
+        - 选择后会出现日期和时间输入框，填入对应的 scheduled_time
+        
+        此方法的核心流程（对每个视频）：
+        1. 找到当前视频所在行的第4列（发布选项列）
+        2. 点击第4列展开发布选项下拉菜单
+        3. 在下拉菜单中选择 "Programar" / "Schedule" / "排期"
+        4. 在出现的日期和时间输入框中填写 scheduled_time
+        5. 关闭面板/确认
         """
         video_count = len(videos)
-        logger.info(f"开始为 {video_count} 个视频逐个设置定时发布时间...")
+        logger.info(f"开始为 {video_count} 个视频逐个设置定时发布时间（第4列发布选项）...")
 
         try:
-            # ========== 策略1: 通过 JS 查找所有视频条目并逐个设置排期时间 ==========
-            # 在 Bulk upload 页面中，每个视频都有一组发布选项
-            # 先尝试找到所有发布选项/排期下拉区域
-            
-            # 查找所有视频条目中的排期选项区域
-            schedule_option_selectors = [
-                # 每个视频条目中的"Schedule"下拉/选项
-                'div[aria-label="Publishing options"]',
-                'div[aria-label="发布选项"]',
-                'div[aria-label="Scheduling options"]',
-                'div[aria-label="排期选项"]',
-                # 下拉菜单触发器
-                'div[aria-label*="date and time"]',
-                'div[aria-label*="日期和时间"]',
-            ]
-            
-            # 查找所有排期选项相关的元素
-            option_elements = None
-            used_selector = None
-            for selector in schedule_option_selectors:
-                count = await page.locator(selector).count()
-                if count > 0:
-                    option_elements = page.locator(selector)
-                    used_selector = selector
-                    logger.info(f"找到 {count} 个排期选项区域: {selector}")
-                    break
+            for i, video in enumerate(videos):
+                scheduled_time = video.scheduled_time
+                if not scheduled_time:
+                    logger.warning(f"视频 {video.file_name} 没有排期时间，跳过")
+                    continue
 
-            if option_elements and await option_elements.count() >= video_count:
-                # 逐个视频设置排期
-                for i, video in enumerate(videos):
-                    try:
-                        scheduled_time = video.scheduled_time
-                        if not scheduled_time:
-                            logger.warning(f"视频 {video.file_name} 没有排期时间，跳过")
-                            continue
-
-                        # 点击当前视频的排期选项
-                        option_el = option_elements.nth(i)
-                        await option_el.click()
-                        await asyncio.sleep(1)
-
-                        # 切换到定时发布模式
-                        await self._switch_to_schedule_mode(page)
-
-                        # 设置日期和时间
-                        await self._fill_schedule_datetime(page, scheduled_time)
-
-                        # 关闭排期面板（点击空白区域或确认按钮）
-                        await self._close_schedule_panel(page)
-                        await asyncio.sleep(0.5)
-
-                        logger.info(
-                            f"视频 {i + 1}/{video_count} ({video.file_name}) "
-                            f"定时发布时间设置为: {scheduled_time}"
-                        )
-                    except Exception as e:
+                try:
+                    # ========== 步骤1: 通过 JS 定位第 i 行的第4列发布选项并点击 ==========
+                    clicked = await self._click_publish_option_cell(page, i)
+                    
+                    if not clicked:
                         logger.warning(
-                            f"设置视频 {i + 1} ({video.file_name}) 排期时间失败: {e}，继续下一个"
+                            f"视频 {i + 1}/{video_count} ({video.file_name}) "
+                            f"未能定位到第4列发布选项，尝试备选方案..."
+                        )
+                        # 备选方案：尝试通过文本定位
+                        clicked = await self._click_publish_option_by_text(page, i)
+                    
+                    if not clicked:
+                        logger.warning(
+                            f"视频 {i + 1}/{video_count} ({video.file_name}) "
+                            f"无法点击发布选项，跳过"
                         )
                         continue
-            else:
-                # ========== 策略2: 通过 JS 遍历所有视频行，逐个设置 ==========
-                logger.info("未找到标准排期选项区域，尝试通过 JS 方式设置...")
-                await self._set_scheduled_times_via_js(page, videos)
+                    
+                    await asyncio.sleep(1)
+
+                    # ========== 步骤2: 在下拉菜单中选择 "Programar" / "Schedule" ==========
+                    await self._switch_to_schedule_mode(page)
+                    await asyncio.sleep(1)
+
+                    # ========== 步骤3: 填写日期和时间 ==========
+                    await self._fill_schedule_datetime(page, scheduled_time)
+
+                    # ========== 步骤4: 关闭排期面板 ==========
+                    await self._close_schedule_panel(page)
+                    await asyncio.sleep(0.5)
+
+                    logger.info(
+                        f"✅ 视频 {i + 1}/{video_count} ({video.file_name}) "
+                        f"定时发布时间设置为: {scheduled_time}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"设置视频 {i + 1}/{video_count} ({video.file_name}) "
+                        f"排期时间失败: {e}，继续下一个"
+                    )
+                    # 确保关闭可能残留的弹窗/面板
+                    try:
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+                    continue
 
             logger.info(f"所有视频定时发布时间设置完成")
 
         except Exception as e:
             logger.warning(f"设置定时发布时间失败: {e}，将以默认方式处理")
+
+    async def _click_publish_option_cell(self, page: Page, row_index: int) -> bool:
+        """
+        通过 JavaScript 精确定位 Bulk upload 表格中第 row_index 行的第4列（发布选项列），
+        并点击该单元格展开发布选项下拉菜单。
+        
+        Meta Business Suite Bulk upload 页面的行结构：
+        - 行容器可能是 div[role="row"], tr, 或具有特定 data-testid 的 div
+        - 每行的子元素（列/单元格）按顺序排列
+        - 第4列（index=3）通常包含 "Publicar ahora" / "Publish now" / "立即发布" 文本
+        
+        返回 True 表示成功点击，False 表示未找到目标。
+        """
+        result = await page.evaluate("""
+            (rowIndex) => {
+                // ========== 策略1: 通过 role="row" 查找表格行 ==========
+                let rows = document.querySelectorAll('div[role="row"], tr[role="row"]');
+                
+                // 过滤掉表头行（可能是第一个 role="row"）
+                const dataRows = [];
+                for (const row of rows) {
+                    // 如果行包含视频文件相关内容（如缩略图、视频名），认为是数据行
+                    const hasMedia = row.querySelector('video, img, [role="img"]');
+                    const hasInput = row.querySelector('input[type="checkbox"]');
+                    if (hasMedia || hasInput) {
+                        dataRows.push(row);
+                    }
+                }
+                
+                // 如果通过 role="row" 找到的数据行不够，尝试其他选择器
+                let targetRows = dataRows.length > rowIndex ? dataRows : null;
+                
+                if (!targetRows) {
+                    // ========== 策略2: 查找所有视频条目容器 ==========
+                    // Bulk upload 页面中每个视频可能是一个独立的容器 div
+                    const containers = document.querySelectorAll(
+                        'div[data-testid*="video"], div[data-testid*="reel"], ' +
+                        'div[data-testid*="upload"], div[role="listitem"]'
+                    );
+                    if (containers.length > rowIndex) {
+                        targetRows = Array.from(containers);
+                    }
+                }
+                
+                if (!targetRows || targetRows.length <= rowIndex) {
+                    // ========== 策略3: 在整个页面中按位置查找所有包含发布选项文本的元素 ==========
+                    const publishOptionKeywords = [
+                        'publicar ahora', 'publish now', '立即发布',
+                        'programar', 'schedule', '排期', '定时发布',
+                        'programada', 'scheduled', '已排期'
+                    ];
+                    const allClickable = document.querySelectorAll(
+                        'div[role="button"], div[aria-haspopup], div[tabindex], span[role="button"]'
+                    );
+                    const publishOptionElements = [];
+                    for (const el of allClickable) {
+                        const text = (el.textContent || '').trim().toLowerCase();
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            for (const kw of publishOptionKeywords) {
+                                if (text.includes(kw) && text.length < 80) {
+                                    publishOptionElements.push({
+                                        element: el,
+                                        text: text,
+                                        y: rect.y
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 按 Y 坐标排序（从上到下对应每个视频行）
+                    publishOptionElements.sort((a, b) => a.y - b.y);
+                    
+                    // 去重（同一行可能有多个匹配元素，取Y坐标相近的第一个）
+                    const uniqueByRow = [];
+                    let lastY = -100;
+                    for (const item of publishOptionElements) {
+                        if (Math.abs(item.y - lastY) > 20) {
+                            uniqueByRow.push(item);
+                            lastY = item.y;
+                        }
+                    }
+                    
+                    if (uniqueByRow.length > rowIndex) {
+                        uniqueByRow[rowIndex].element.click();
+                        return {
+                            success: true,
+                            method: 'text_position',
+                            text: uniqueByRow[rowIndex].text,
+                            total: uniqueByRow.length
+                        };
+                    }
+                    
+                    return {
+                        success: false,
+                        method: 'none',
+                        dataRowCount: dataRows.length,
+                        publishOptionCount: publishOptionElements.length,
+                        uniqueRowCount: uniqueByRow ? uniqueByRow.length : 0
+                    };
+                }
+                
+                // ========== 定位到目标行的第4列 ==========
+                const targetRow = targetRows[rowIndex];
+                
+                // 获取行内所有直接子元素（列/单元格）
+                const cells = targetRow.querySelectorAll(':scope > div, :scope > td');
+                
+                if (cells.length >= 5) {
+                    // 直接点击第4列（index=3）
+                    const cell5 = cells[4];
+                    // 在第4列中查找可点击元素
+                    const clickTarget = cell5.querySelector(
+                        'div[role="button"], div[aria-haspopup], div[tabindex], ' +
+                        'span[role="button"], button'
+                    ) || cell5;
+                    clickTarget.click();
+                    return {
+                        success: true,
+                        method: 'cell_index',
+                        cellCount: cells.length,
+                        cellText: (cell5.textContent || '').trim().substring(0, 80)
+                    };
+                }
+                
+                // 如果直接子元素不到4个，在行内查找包含发布选项关键词的元素
+                const publishKeywords = [
+                    'publicar ahora', 'publish now', '立即发布',
+                    'programar', 'schedule', '排期',
+                    'programada', 'scheduled', '已排期'
+                ];
+                const rowClickables = targetRow.querySelectorAll(
+                    'div[role="button"], div[aria-haspopup], div[tabindex], ' +
+                    'span[role="button"], button, select'
+                );
+                for (const el of rowClickables) {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    for (const kw of publishKeywords) {
+                        if (text.includes(kw)) {
+                            el.click();
+                            return {
+                                success: true,
+                                method: 'keyword_in_row',
+                                text: text.substring(0, 80)
+                            };
+                        }
+                    }
+                }
+                
+                return {
+                    success: false,
+                    method: 'row_found_but_no_cell',
+                    cellCount: cells.length,
+                    rowText: (targetRow.textContent || '').trim().substring(0, 200)
+                };
+            }
+        """, row_index)
+
+        if result and result.get('success'):
+            logger.info(
+                f"已点击第 {row_index + 1} 行发布选项 "
+                f"(方式: {result.get('method')}, 文本: {result.get('text', result.get('cellText', 'N/A'))})"
+            )
+            return True
+        else:
+            logger.warning(f"第 {row_index + 1} 行发布选项定位失败: {result}")
+            return False
+
+    async def _click_publish_option_by_text(self, page: Page, row_index: int) -> bool:
+        """
+        备选方案：通过 Playwright 选择器文本匹配的方式，
+        找到页面上第 row_index 个 "Publicar ahora" / "Publish now" / "立即发布" 元素并点击。
+        
+        这种方式不依赖行结构，而是直接查找所有发布选项文本元素。
+        """
+        publish_now_selectors = [
+            'span:has-text("Publicar")',
+            'span:has-text("Publicar ahora")',
+            'span:has-text("Publish now")',
+            'span:has-text("立即发布")',
+            'div[role="button"]:has-text("Publicar ahora")',
+            'div[role="button"]:has-text("Publish now")',
+            'div[role="button"]:has-text("立即发布")',
+            # 已经设为定时的也要能点击重新设置
+            'span:has-text("Programada")',
+            'span:has-text("Scheduled")',
+            'span:has-text("已排期")',
+            'div[role="button"]:has-text("Programada")',
+            'div[role="button"]:has-text("Scheduled")',
+            'div[role="button"]:has-text("已排期")',
+        ]
+        
+        for selector in publish_now_selectors:
+            try:
+                elements = page.locator(selector)
+                count = await elements.count()
+                if count > row_index:
+                    el = elements.nth(row_index)
+                    if await el.is_visible(timeout=2000):
+                        await el.click()
+                        logger.info(
+                            f"通过文本匹配点击第 {row_index + 1} 个发布选项: {selector}"
+                        )
+                        return True
+            except Exception:
+                continue
+        
+        return False
 
     async def _switch_to_schedule_mode(self, page: Page):
         """
